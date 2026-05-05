@@ -87,6 +87,29 @@ curl -H "Authorization: Bearer $FASOL_API_KEY" \
      "$FASOL_API_BASE_URL/scope"
 ```
 
+### Wallet binding
+
+Your agent is bound to **ONE specific Solana wallet** chosen by your owner at create-time. This is a hard server-side boundary, not advice:
+
+- **Writes** (`POST /swap`, `POST /orders`, `DELETE /orders/:id`) execute on **that wallet only**. You cannot pass a `wallet` parameter to override it.
+- **`/wallet_balance`** returns that wallet's SOL balance.
+- **`tx_stream`** only delivers tx events for that wallet.
+- **Orders are per-wallet on the engine side.** TP/SL/trailing orders activate only when a swap from the SAME wallet fires. If you place TP/SL but the matching buy executes on a different wallet, the orders never arm — they sit dormant forever. The bound-wallet model fixes this end-to-end: your swap and your orders both live on the same wallet, so activation works.
+- **Reads** (`GET /positions`, `GET /orders`, `GET /trades`) span ALL of the user's wallets. If you want a single-wallet view, filter client-side using `wallet === <your wallet>` from `/scope`.
+- **You cannot switch wallets via the API.** The owner picks the wallet in the AI Agents UI. They can change it there; on next call you'll see the new wallet via `/scope`.
+
+After connecting, **always call `GET /scope` first** — `data.wallet` tells you which wallet you're bound to. Use it as your "self" identifier for any read-side filtering.
+
+#### 412 — wallet not set
+
+If `GET /scope` (or any other call) returns **`412 Precondition Failed`** with `{ "error": "agent_wallet_unset" }`, your owner has not picked a wallet yet. **Tell them:**
+
+> "I need a wallet bound to this key before I can do anything. Open the AI Agents UI and pick a wallet for me."
+
+Do NOT retry — 412 won't recover until the owner acts.
+
+`{ "error": "agent_wallet_invalid" }` means the wallet was deleted or no longer belongs to the user. Same response: ask them to pick a fresh wallet.
+
 > **⚠️ Agent API ≠ web API. Use ONLY `$FASOL_API_BASE_URL/...` paths from this skill.**
 >
 > The Fasol platform exposes the same features through two parallel URL trees:
@@ -106,7 +129,7 @@ curl -H "Authorization: Bearer $FASOL_API_KEY" \
 - **`coin_address`** — Solana SPL mint address. Base58, 32–44 chars (e.g. `So11111111111111111111111111111111111111112`). The token mint.
 - **`pair_address`** — DEX pair address (Raydium AMM / pump.fun bonding curve / etc). The agent rarely supplies this directly — most write endpoints derive it from `coin_address` server-side.
 - **`deployer`** — wallet that originally created the coin. Reachable via `dev_history`.
-- **`wallet`** — the user's primary trading wallet. **Server-derived** from your authenticated user. You do NOT pass it. You also cannot query *other* wallets.
+- **`wallet`** — the wallet your agent is bound to (server-locked at create time, see "Wallet binding" above). You do NOT pass it on writes — server enforces. Call `GET /scope` once on startup, read `data.wallet`, and treat it as your "self".
 
 ### Numbers
 - **All numeric fields are strings** in JSON to preserve precision. Use BigNumber on your side; don't do float math on lamport values.
@@ -939,6 +962,8 @@ for await (const evt of subscribeAlertMatchStream()) {
 ## TP/SL/trailing lifecycle — they persist and re-arm
 
 > **⚠️ Critical for strategy authors:** when a `take_profit`, `stop_loss`, or `trailing` order **fires** (the sell executes), the order entity is **NOT deleted** — it just becomes deactivated/sleeping. Crucially, **the next time a position opens on the same coin, the order re-arms** with a fresh `trigger_price` computed against the new entry.
+
+> **Orders are per-wallet on the engine side.** TP/SL/trailing orders activate only when a swap from the SAME wallet fires (engine filters `o.wallet === tx.wallet`). Since your agent is bound to one wallet (see "Wallet binding"), this is invisible to you — every order you place is on `<your wallet>` and every swap you fire is on `<your wallet>`, so activation always works. Don't try to manage orders on the user's other wallets — you can't (server rejects), and even if you could the cross-wallet activation would never trigger.
 >
 > This is by design (so you can hit the same exit ladder repeatedly on a coin you scalp), but it's a sharp edge for any agent that loops:
 >
