@@ -87,6 +87,29 @@ curl -H "Authorization: Bearer $FASOL_API_KEY" \
      "$FASOL_API_BASE_URL/scope"
 ```
 
+### Keeping this skill up to date
+
+This file evolves — new endpoints, fixes, contract changes ship to the public skill repo at <https://github.com/fasol-robot/fasol-skills> as soon as they land on prod. **Re-read it daily** so you know what's new and what's still safe to call.
+
+Two ways to refresh, in order of preference:
+
+1. **Git clone (preferred)** — full repo so you also get the `scripts/` helpers (`copy-trader.mjs`, `lib/sse.mjs`, etc.) and pull-only updates:
+   ```bash
+   # First time
+   git clone https://github.com/fasol-robot/fasol-skills /tmp/fasol-skills
+   # Daily refresh (idempotent)
+   git -C /tmp/fasol-skills pull --ff-only
+   # Read the freshest skill
+   cat /tmp/fasol-skills/fasol-agent/SKILL.md
+   ```
+2. **Raw HTTPS fallback** — when git isn't available in your runtime:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/fasol-robot/fasol-skills/main/fasol-agent/SKILL.md \
+     -o /tmp/fasol-agent-SKILL.md
+   ```
+
+If your runtime supports a startup hook, run the refresh there. Otherwise, do it once at the top of each session and again every 24h. Behaviour you observed last week may have changed — never assume the cached file is current after a multi-day gap.
+
 ### Wallet binding
 
 Your agent is bound to **ONE specific Solana wallet** chosen by your owner at create-time. This is a hard server-side boundary, not advice:
@@ -120,6 +143,88 @@ Do NOT retry — 412 won't recover until the owner acts.
 > | Web / TMA API | `…/trading_bot/<feature>` (kebab-case, e.g. `/tracked-wallets/all`) | `Authorization: tma <initData>` or web JWT | **NO — agent key returns 401** |
 >
 > If you grep the platform's frontend code or web docs you'll see kebab-case paths under `/trading_bot/`. **Do not use those.** They are the user's web-app routes and require web session auth — your Bearer key will be rejected. Always start the URL with `$FASOL_API_BASE_URL` (which already ends in `/trading_bot/agent`) and use the snake_case routes documented in this skill.
+
+---
+
+## Rate limits & cost awareness
+
+Each API key has three independent **per-minute tier buckets** plus one **per-second burst bucket**. The buckets reset every minute (fixed window). Live SSE streams are capped by **concurrent-connection count** instead.
+
+| Tier      | Limit (rpm) | Use case                                                       |
+|-----------|-------------|----------------------------------------------------------------|
+| standard  | **120**     | ~25 of 38 endpoints — Redis / in-memory / single PG-by-PK reads |
+| medium    | **30**      | Single CH read, Solana RPC call, multi-coin enrich              |
+| heavy     | **5**       | Multi-day CH scan / JOIN over swap_w / leaderboard agg          |
+
+| Limit type           | Cap                          |
+|----------------------|------------------------------|
+| per-second burst     | **10 req/sec/key** (any tier)|
+| concurrent SSE       | **5 connections/key total**  |
+
+**A heavy or medium request increments BOTH the standard bucket AND its tier-specific bucket.** Standard is the umbrella cap on total request volume; tier buckets are tighter sub-caps on the expensive subset.
+
+### Per-endpoint cost
+
+| Tier      | Endpoints |
+|-----------|-----------|
+| standard  | `GET /scope`, `GET /rate_limit`, `GET /coin/:ca/stats`, `GET /coin/:ca/candles_fast`, `GET /orders`, `GET /coin/:ca/orders`, `GET /alerts`, `GET /wallet_groups`, `GET /tracked_wallets`, all alert toggles (`pause`/`unpause`/`toggle-telegram`/`autobuy`), `POST /orders`, `DELETE /orders/:id`, `DELETE /alert/:id`, all wallet-tracking CRUD |
+| medium    | `GET /positions`, `GET /trades`, `GET /wallet_balance`, `GET /dev/:deployer`, `GET /tracked_wallets/live_trades`, `POST /swap`, `POST /wallet_search`, `GET /snapshot/coin/:ca/history`, `GET /snapshot/coin/:ca/agg`, `POST /snapshot/coin/:ca/first_match`, `GET /alerts/triggered/:coinAddress`, `POST /alerts`, `PUT /alert/:id` |
+| heavy     | `POST /snapshot/scan`, `GET /coin/:ca/candles` (historical), `GET /alert/:id/stats` |
+
+SSE streams (concurrent-connection-capped, NOT rpm): `/agent_stream/coin/:ca`, `/agent_stream/coin/:ca/trades`, `/agent_stream/tx`, `/agent_stream/tracked_wallet_trades`, `/agent_stream/alert_matches`.
+
+### Be a good citizen
+
+- **Cache results.** Coin stats, dev history, candle bars don't change every second. Hold them locally for 5–60s before re-fetching.
+- **Prefer streams over polling for real-time data.** A long-lived `/agent_stream/coin/:ca` doesn't burn HTTP budget. Polling `/coin/:ca/stats` every second does — and burns through standard tier in 30s.
+- **Back off on 429.** Honor `Retry-After`. Expand to exponential delay if the same tier 429s twice in a row. Do not tight-loop a 429.
+- **Never spin on a heavy endpoint.** `/snapshot/scan`, historical `/coin/:ca/candles`, `/alert/:id/stats` are 5 rpm — 1 call every 12+ seconds is the maximum sustainable rate. Treat them like reports, not feeds.
+- **Check `GET /rate_limit` if unsure.** Returns your current usage across all three tiers + the endpoint→tier map so you can self-throttle without guessing. Cheap (standard tier) — but don't poll it under 30s.
+
+### `GET /rate_limit` — always allowed
+
+No scope required. Same access as `/scope`.
+
+```bash
+curl -s -H "Authorization: Bearer $FASOL_API_KEY" "$FASOL_API_BASE_URL/rate_limit"
+```
+
+```jsonc
+{
+  "data": {
+    "tiers": {
+      "standard": { "limit_per_min": 120, "used": 47, "remaining": 73 },
+      "medium":   { "limit_per_min": 30,  "used": 4,  "remaining": 26 },
+      "heavy":    { "limit_per_min": 5,   "used": 0,  "remaining": 5 }
+    },
+    "burst": { "limit_per_sec": 10, "used": 1 },
+    "sse_connections": { "limit": 5, "active": 1 },
+    "endpoint_tier": {
+      "GET /coin/:ca/stats": "standard",
+      "POST /snapshot/scan": "heavy",
+      "POST /wallet_search": "medium"
+      // ... full route list
+    },
+    "reset_in_sec": 23,
+    "server_time": "2026-05-07T12:34:37Z"
+  }
+}
+```
+
+### 429 response shape
+
+```jsonc
+{
+  "error": "rate_limit_exceeded",
+  "tier": "heavy",                          // "standard" | "medium" | "heavy" — absent for burst (per-sec)
+  "scope": "minute",                        // "minute" | "second" | "sse"
+  "limit": 5,
+  "window": "1m",                           // "1m" | "1s" — absent for sse
+  "endpoint_tier_map_url": "/agent/rate_limit"
+}
+```
+
+Plus an `sse_concurrent_limit` variant when you exceed the 5-connection cap on SSE — same shape with `scope: "sse"`, no `tier` field.
 
 ---
 
