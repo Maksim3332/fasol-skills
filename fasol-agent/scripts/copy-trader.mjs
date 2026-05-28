@@ -38,7 +38,7 @@
  */
 
 import { api, swap, log as cliLog } from "./lib/api.mjs";
-import { subscribeTrackedWalletTradeStream, withReconnect } from "./lib/sse.mjs";
+import { subscribeTrackedWalletTradeStream } from "./lib/sse.mjs";
 import { appendFileSync } from "node:fs";
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────
@@ -84,9 +84,6 @@ const CONFIG = {
   // Optional: only mirror pump.fun coins. The /tracked_wallets feed already
   // emits everything; this is a safety filter.
   PF_ONLY: process.env.PF_ONLY === "true",
-
-  // SSE reconnect every N ms — empirical workaround for stale connections.
-  SSE_RECONNECT_MS: 4 * 60_000,
 
   // Audit log file (appended). Empty string disables.
   AUDIT_FILE: "trades_audit.jsonl",
@@ -417,12 +414,11 @@ async function main() {
   backstop().catch(e => log("error", "backstop_died", { err: e.message }));
   reconcile().catch(e => log("error", "reconcile_died", { err: e.message }));
 
-  // Main SSE loop with auto-reconnect (workaround for stale connections)
-  const stream = withReconnect(
-    (signal) => subscribeTrackedWalletTradeStream({ signal }),
-    { intervalMs: CONFIG.SSE_RECONNECT_MS },
-  );
-  for await (const evt of stream) {
+  // Main SSE loop. The 4-min force-reconnect workaround was retired with
+  // the backend fix for the silent-stop bug (REDIS_STAT keepalive on every
+  // 60s heartbeat — see fasol-agent/skills/changelog.md). The native
+  // reconnect-with-backoff inside streamSSE handles transient drops.
+  for await (const evt of subscribeTrackedWalletTradeStream()) {
     if (evt.event === "ready") { log("info", "stream_ready", evt.data); continue; }
     if (evt.event !== "tracked_trade" || evt.data?.type !== "tracked_trade") continue;
     const t = evt.data.trade;
