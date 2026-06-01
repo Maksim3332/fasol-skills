@@ -30,6 +30,44 @@ metadata:
 
 ---
 
+## 2026-06-02 — `/alerts/triggered/:coin_address` — bad input now 400, not 500
+
+**Where:** `GET /alerts/triggered/:coin_address` — same handler under both
+Agent API (`/agent_stream/...` neighbour at `/agent/...`) and the web/TMA
+surface (`/trading_bot/...`). Sub-skill: [alerts-read](alerts-read.md).
+
+**What changed:** Handler now validates the path param via
+`isValidSolanaAddress` before calling `cleanSolanaAddress` (which internally
+constructs a `PublicKey` and throws on any non-32-byte base58). Previously
+the throw was caught by the generic `try/catch` and turned into
+`500 Server Error` with a generic body — confusing for agents that
+mistakenly passed an `alert_id` or a valid-looking-but-short mint
+(production case: a 38-character base58 that decoded to <32 bytes).
+
+The response on bad input is now:
+
+```json
+{
+  "error_text": "Invalid coin_address: expected a base58 Solana mint (32 bytes / 32–44 chars). The path param is a coin mint, not an alert_id.",
+  "got": "<whatever you passed>"
+}
+```
+
+Driven by 200+ 500s in `db.agent_event` across 5 users over the 8–13 May
+window, every one of them landing on the same code path. The valid-input
+path is unchanged.
+
+**What the agent should do:**
+- Re-read the [alerts-read sub-skill](alerts-read.md) — the path param is
+  a **coin mint**, not an `alert_id`. If you want per-alert detail, use
+  `/alert/:id/stats`.
+- On 400 from this endpoint, read `error_text` and `got` to confirm what
+  you sent. Don't retry the same input.
+
+**Roll-out status:** ⏳ shipping in the next backend release.
+
+---
+
 ## 2026-06-02 — Two new live streams: smart_money_trades + calls
 
 **Where:** new endpoints `GET /agent_stream/smart_money_trades` and

@@ -47,7 +47,25 @@ uses it to render markers on the coin chart; an agent can use it to decide
 whether the user has already had an alert opinion on a coin before reacting
 to a fresh signal.
 
+> ⚠️ **The path parameter is a coin mint, not an alert_id.** Pass a base58
+> Solana mint (32 bytes / 32–44 chars). Production telemetry shows agents
+> often mis-interpret this endpoint and pass an alert_id like `14867` or
+> the string `all` — the server now returns **400 Invalid coin_address**
+> in that case, but the underlying request is wrong: you want
+> [`/alert/:id/stats`](alerts-read.md) for per-alert detail. This endpoint
+> tells you "which of MY alerts matched THIS coin", not "what matched this
+> alert".
+
 ```bash
 curl -s -H "Authorization: Bearer $FASOL_API_KEY" \
-  "$FASOL_API_BASE_URL/alerts/triggered/<COIN>"
+  "$FASOL_API_BASE_URL/alerts/triggered/<COIN_MINT>"
+```
+
+On bad input the server replies:
+
+```jsonc
+{
+  "error_text": "Invalid coin_address: expected a base58 Solana mint (32 bytes / 32–44 chars). The path param is a coin mint, not an alert_id.",
+  "got": "<whatever you passed>"
+}
 ```
