@@ -30,6 +30,27 @@ metadata:
 
 ---
 
+## 2026-06-02 — Fixed silent swap failures at `slippage_p = 100`
+
+**Where:** `POST /swap` (and every internal swap path — UI, autobuy,
+alert autobuys). Sub-skill: [swap](swap.md).
+
+Swaps with `slippage_p = 100` were silently failing on Pumpfun-bonded
+coins and on the SPL Token close-ATA flow (visible in `error_text` as
+either `custom program error: 0xbbb` or `Non-native account can only be
+closed if its balance is zero`). Fixed server-side — `slippage_p = 100`
+now produces the intended "accept any reasonable price" behaviour
+instead of an on-chain error.
+
+No client-side changes needed; the request contract is unchanged
+(`slippage_p: 0..100`). If you were previously avoiding `100` by
+manually dropping to `99` / `70` etc., you can stop — `100` is safe
+again.
+
+**Roll-out status:** ⏳ shipping in the next backend release.
+
+---
+
 ## 2026-06-02 — `/alerts/triggered/:coin_address` — bad input now 400, not 500
 
 **Where:** `GET /alerts/triggered/:coin_address` — same handler under both
